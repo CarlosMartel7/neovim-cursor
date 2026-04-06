@@ -117,6 +117,10 @@ local function show(id, config)
     vim.api.nvim_win_set_height(term.win, size)
   end
 
+  -- No line-number column in the agent panel (avoid inheriting global number/relativenumber)
+  vim.api.nvim_win_set_option(term.win, "number", false)
+  vim.api.nvim_win_set_option(term.win, "relativenumber", false)
+
   -- Update active terminal
   active_id = id
 
@@ -305,5 +309,6 @@ M._get_terminal = get_terminal
 M._set_active = function(id) active_id = id end
 M._get_active_id = function() return active_id end
 
-return M
+require("neovim-cursor.log").debug("terminal", "loaded")
 
+return M

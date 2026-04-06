@@ -259,4 +259,6 @@ function M.pick_terminal(config, callback)
   pick_with_ui_select(terminals, callback)
 end
 
+require("neovim-cursor.log").debug("picker", "loaded")
+
 return M

@@ -237,4 +237,6 @@ function M.get_state()
   }
 end
 
+require("neovim-cursor.log").debug("tabs", "loaded")
+
 return M

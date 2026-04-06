@@ -306,5 +306,6 @@ M.terminal = terminal
 M.tabs = tabs
 M.picker = picker
 
-return M
+require("neovim-cursor.log").debug("init", "loaded")
 
+return M

@@ -11,3 +11,4 @@ vim.g.loaded_neovim_cursor = true
 -- Users can override this by calling require('neovim-cursor').setup() in their config
 require("neovim-cursor").setup()
 
+require("neovim-cursor.log").debug("plugin", "loaded")

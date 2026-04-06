@@ -50,5 +50,6 @@ function M.setup(user_config)
   return vim.tbl_deep_extend("force", M.defaults, user_config)
 end
 
-return M
+require("neovim-cursor.log").debug("config", "loaded")
 
+return M
