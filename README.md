@@ -17,7 +17,7 @@ This was created using cursor 😊 in 20 minutes, it doesn't have to be perfect,
 - ⌨️ **Full terminal mode support** - manage agents without leaving the terminal
 - 📝 Send visual selections and file paths to the Cursor agent
 - 💾 Persistent terminal sessions (hide/show without restarting)
-- ⚙️ Fully configurable (keybindings, split position, size, etc.)
+- ⚙️ Fully configurable (keybindings, split position, separator, multiple visible splits, line numbers, etc.)
 - 🎯 Written in pure Lua
 
 
@@ -84,6 +84,8 @@ Work with multiple AI agents simultaneously for different tasks:
 | `<leader>an` | Create new agent terminal with custom prompt |
 | `<leader>at` | Select agent from fuzzy picker (with live preview) |
 | `<leader>ar` | Rename current agent terminal |
+| `<leader>aq` | Delete current agent terminal |
+| `<S-n>` / `<S-l>` | Focus next / previous window |
 
 #### From Terminal Mode
 
@@ -91,7 +93,8 @@ When you're inside an agent terminal, you can manage agents without leaving:
 
 | Keybinding | Action |
 |------------|--------|
-| `<Esc>` | Exit terminal mode / hide agent window |
+| `<Esc>` | Exit terminal mode (Normal mode in buffer; use `<leader>` maps, then e.g. toggle to hide) |
+| `<S-n>` / `<S-l>` | Focus next / previous window (from terminal mode) |
 | `<C-n>` | Create new agent terminal |
 | `<C-t>` | Select agent from fuzzy picker |
 | `<C-r>` | Rename current agent terminal |
@@ -136,6 +139,7 @@ The plugin provides comprehensive commands for all operations:
 - `:CursorAgentSelect` - Open agent picker
 - `:CursorAgentRename [name]` - Rename active agent (interactive if no argument)
 - `:CursorAgentList` - List all agent terminals with status
+- `:CursorAgentDelete` - Delete active agent terminal
 
 > **Note:** To close an agent terminal, simply type `exit` in the terminal or press `Ctrl+D`
 
@@ -155,18 +159,25 @@ require("neovim-cursor").setup({
     new = "<leader>an",          -- Create new agent terminal
     select = "<leader>at",       -- Select agent terminal (fuzzy picker)
     rename = "<leader>ar",       -- Rename current agent terminal
+    delete = "<leader>aq",       -- Delete current agent terminal
+    next_window = "<S-n>",       -- Focus next split window (Normal mode; also in agent terminal)
+    prev_window = "<S-l>",       -- Focus previous split window
   },
 
-  -- Terminal naming configuration
+  -- Terminal naming and behavior
   terminal = {
     default_name = "Agent",      -- Default name prefix for terminals
     auto_number = true,          -- Auto-append numbers (Agent 1, Agent 2, etc.)
+    hide_line_numbers = true,    -- Hide number/relativenumber in agent windows (false = inherit global)
+    multiple_windows = false,    -- If true, keep other agent splits visible when switching/creating
   },
 
   -- Terminal split configuration
   split = {
     position = "right",  -- "right", "left", "top", "bottom"
     size = 0.5,          -- 50% of editor width/height (0.0-1.0)
+    separator = true,    -- Draw a visible split line between editor and agent (see separator_highlight)
+    separator_highlight = { fg = "#ffffff" },  -- :help nvim_set_hl() fields for WinSeparator highlight
   },
 
   -- CLI command to run
@@ -197,6 +208,9 @@ require("neovim-cursor").setup({
     new = "<C-n>",          -- Use Ctrl+n for new terminal
     select = "<C-s>",       -- Use Ctrl+s for select
     rename = "<leader>rn",  -- Use <leader>rn for rename
+    delete = "<leader>rq",  -- Use <leader>rq for delete
+    next_window = "<S-n>",  -- optional overrides
+    prev_window = "<S-l>",
   },
 })
 ```
@@ -219,6 +233,43 @@ require("neovim-cursor").setup({
   split = {
     position = "left",
     size = 0.4,
+  },
+})
+```
+
+#### Multiple visible agent splits
+
+When `terminal.multiple_windows` is `true`, switching agents or creating a new one from terminal mode does **not** hide other agent windows, so you can keep several splits open at once. When `false` (default), only one agent split is visible at a time (previous one is hidden).
+
+```lua
+require("neovim-cursor").setup({
+  terminal = {
+    multiple_windows = true,
+  },
+})
+```
+
+#### Line numbers in the agent window
+
+By default the plugin turns off `number` and `relativenumber` in agent windows. Set `hide_line_numbers = false` to use your global editor settings there.
+
+```lua
+require("neovim-cursor").setup({
+  terminal = {
+    hide_line_numbers = false,
+  },
+})
+```
+
+#### Split separator (vertical line)
+
+A highlighted `WinSeparator` is applied on the agent split so the boundary is easy to see. Disable it or change the color:
+
+```lua
+require("neovim-cursor").setup({
+  split = {
+    separator = true,
+    separator_highlight = { fg = "#ffffff" },
   },
 })
 ```
@@ -282,7 +333,7 @@ print(vim.inspect(state))
 ### Multi-Terminal API
 
 ```lua
-local tabs = require("neovim-cursor.tabs")
+local tabs = require("neovim-cursor.windows.tabs")
 
 -- Get active terminal ID
 local active_id = tabs.get_active()

@@ -5,7 +5,7 @@
 -- - Managing terminal visibility (show/hide)
 -- - Sending text to terminal buffers
 -- - Terminal lifecycle (on_exit callbacks)
--- - Terminal mode keybindings (<Esc>, <C-n>, <C-t>, <C-r>)
+-- - Terminal mode keybindings (<Esc> exits terminal mode; <C-n>, <C-t>, <C-r>)
 --
 -- Architecture:
 -- - Stores terminal instances with buffers, windows, and job IDs
@@ -14,12 +14,40 @@
 -- - Buffer-local keybindings are set up for each terminal
 --
 local M = {}
+local log = require("neovim-cursor.log")
+local buffer_keybindings = require("neovim-cursor.keybidings.buffer")
 
 -- State tracking for multiple terminals
 local terminals = {}  -- Table of terminal instances keyed by ID (stores buf, win, job_id)
 local active_id = nil  -- Currently active terminal ID
 local default_id = "default"  -- Default terminal ID for backward compatibility
 local cleanup_callbacks = {}  -- Callbacks to call when a terminal exits (used by tabs.lua for state sync)
+
+-- Centralized cleanup so on_exit and explicit delete stay in sync.
+local function cleanup_terminal(id, exit_code)
+  local term = terminals[id]
+  if not term then
+    return
+  end
+
+  term.job_id = nil
+
+  if term.buf and vim.api.nvim_buf_is_valid(term.buf) then
+    vim.api.nvim_buf_delete(term.buf, { force = true })
+  end
+
+  term.buf = nil
+  term.win = nil
+  terminals[id] = nil
+
+  if active_id == id then
+    active_id = nil
+  end
+
+  for _, callback in ipairs(cleanup_callbacks) do
+    pcall(callback, id, exit_code)
+  end
+end
 
 -- Get a terminal instance by ID (defaults to active or default terminal)
 local function get_terminal(id)
@@ -60,6 +88,7 @@ end
 -- Hide the terminal window
 local function hide(id)
   id = id or active_id or default_id
+  log.debug("terminal", "hide", { id = id })
   if is_visible(id) then
     local term = get_terminal(id)
     if term then
@@ -77,6 +106,7 @@ end
 -- Show the terminal window
 local function show(id, config)
   id = id or active_id or default_id
+  log.debug("terminal", "show", { id = id, config = config })
   if not is_buffer_valid(id) then
     return false
   end
@@ -85,6 +115,8 @@ local function show(id, config)
   if not term then
     return false
   end
+
+  local source_win = vim.api.nvim_get_current_win()
 
   -- Calculate split size
   local size
@@ -117,9 +149,38 @@ local function show(id, config)
     vim.api.nvim_win_set_height(term.win, size)
   end
 
-  -- No line-number column in the agent panel (avoid inheriting global number/relativenumber)
-  vim.api.nvim_win_set_option(term.win, "number", false)
-  vim.api.nvim_win_set_option(term.win, "relativenumber", false)
+  -- Optional: hide line-number column in the agent panel
+  local hide_nums = config.terminal and config.terminal.hide_line_numbers
+  if hide_nums == nil then
+    hide_nums = true
+  end
+  if hide_nums then
+    vim.api.nvim_win_set_option(term.win, "number", false)
+    vim.api.nvim_win_set_option(term.win, "relativenumber", false)
+  end
+
+  -- Visible split separator (white line between main editor and agent window)
+  if config.split and config.split.separator then
+    local hl = (config.split.separator_highlight or { fg = "#ffffff" })
+    vim.api.nvim_set_hl(0, "NeovimCursorWinSeparator", hl)
+
+    -- Map both groups for compatibility across Neovim versions/colorschemes.
+    local winhl = "WinSeparator:NeovimCursorWinSeparator,VertSplit:NeovimCursorWinSeparator"
+    vim.api.nvim_win_set_option(term.win, "winhighlight", winhl)
+    if vim.api.nvim_win_is_valid(source_win) then
+      vim.api.nvim_win_set_option(source_win, "winhighlight", winhl)
+    end
+
+    -- Ensure the separator character is visible even if user's fillchars hides it.
+    local existing_fillchars = vim.wo[term.win].fillchars or ""
+    if not existing_fillchars:match("vert:") then
+      local separator_fillchars = existing_fillchars
+      if separator_fillchars ~= "" and not separator_fillchars:match(",$") then
+        separator_fillchars = separator_fillchars .. ","
+      end
+      vim.wo[term.win].fillchars = separator_fillchars .. "vert:│"
+    end
+  end
 
   -- Update active terminal
   active_id = id
@@ -130,6 +191,8 @@ end
 -- Create a new terminal instance (reusable function for creating terminals)
 -- This is the extracted logic that can be used for multiple terminals
 local function create_terminal_instance(id, config)
+  log.debug("terminal", "create_terminal_instance", { id = id, command = config.command })
+
   -- Initialize terminal state if it doesn't exist
   if not terminals[id] then
     terminals[id] = {
@@ -151,26 +214,8 @@ local function create_terminal_instance(id, config)
   -- Start the terminal
   term.job_id = vim.fn.termopen(config.command, {
     on_exit = function(_, exit_code, _)
-      -- Clean up state when terminal exits
-      term.job_id = nil
-      if term.buf and vim.api.nvim_buf_is_valid(term.buf) then
-        vim.api.nvim_buf_delete(term.buf, { force = true })
-      end
-      term.buf = nil
-      term.win = nil
-
-      -- Remove terminal from table
-      terminals[id] = nil
-
-      -- Clear active_id if this was the active terminal
-      if active_id == id then
-        active_id = nil
-      end
-
-      -- Call cleanup callbacks (for tabs module to sync)
-      for _, callback in ipairs(cleanup_callbacks) do
-        pcall(callback, id, exit_code)
-      end
+      log.debug("terminal", "on_exit", { id = id, exit_code = exit_code })
+      cleanup_terminal(id, exit_code)
 
       -- Call user callback if provided
       if config.term_opts.on_close then
@@ -179,41 +224,7 @@ local function create_terminal_instance(id, config)
     end,
   })
 
-  -- Set up buffer-local keymaps for terminal mode
-  vim.api.nvim_buf_set_keymap(term.buf, 't', '<Esc>', '<C-\\><C-n>:lua require("neovim-cursor.terminal").hide()<CR>', {
-    noremap = true,
-    silent = true,
-    desc = "Exit terminal window"
-  })
-
-  -- Set up buffer-local keymap for normal mode in terminal
-  vim.api.nvim_buf_set_keymap(term.buf, 'n', '<Esc>', ':lua require("neovim-cursor.terminal").hide()<CR>', {
-    noremap = true,
-    silent = true,
-    desc = "Hide terminal window"
-  })
-
-  -- Set up buffer-local keymap for creating new terminal from terminal mode
-  -- First hide current terminal, then create new one
-  vim.api.nvim_buf_set_keymap(term.buf, 't', '<C-n>', '<C-\\><C-n>:lua require("neovim-cursor").new_terminal_from_terminal_handler()<CR>', {
-    noremap = true,
-    silent = true,
-    desc = "Create new agent terminal (hide current first)"
-  })
-
-  -- Set up buffer-local keymap for renaming current terminal from terminal mode
-  vim.api.nvim_buf_set_keymap(term.buf, 't', '<C-r>', '<C-\\><C-n>:lua require("neovim-cursor").rename_terminal_handler()<CR>', {
-    noremap = true,
-    silent = true,
-    desc = "Rename current agent window"
-  })
-
-  -- Set up buffer-local keymap for selecting terminal from terminal mode
-  vim.api.nvim_buf_set_keymap(term.buf, 't', '<C-t>', '<C-\\><C-n>:lua require("neovim-cursor").select_terminal_handler()<CR>', {
-    noremap = true,
-    silent = true,
-    desc = "Select agent terminal"
-  })
+  buffer_keybindings.setup_agent_terminal_buffer(term.buf, config.keybindings)
 
   -- Enter insert mode in terminal
   vim.cmd("startinsert")
@@ -237,6 +248,7 @@ end
 -- Toggle terminal visibility
 function M.toggle(config, id)
   id = id or active_id or default_id
+  log.debug("terminal", "toggle", { id = id })
   
   if is_visible(id) then
     -- Terminal is visible, hide it
@@ -254,6 +266,7 @@ end
 -- Send text to the terminal
 function M.send_text(text, id)
   id = id or active_id or default_id
+  log.debug("terminal", "send_text", { id = id, text_len = #text })
   
   if not M.is_running(id) then
     vim.notify("Cursor agent terminal is not running", vim.log.levels.WARN)
@@ -271,6 +284,32 @@ function M.send_text(text, id)
   end
 
   return false
+end
+
+-- Delete a terminal instance, including its running job/buffer.
+function M.delete(id)
+  id = id or active_id or default_id
+  local term = get_terminal(id)
+  if not term then
+    return false
+  end
+
+  hide(id)
+
+  if term.job_id then
+    pcall(vim.fn.jobstop, term.job_id)
+  end
+
+  if term.buf and vim.api.nvim_buf_is_valid(term.buf) then
+    vim.api.nvim_buf_delete(term.buf, { force = true })
+  end
+
+  -- If on_exit hasn't executed yet, ensure state is still cleaned.
+  if terminals[id] then
+    cleanup_terminal(id, 0)
+  end
+
+  return true
 end
 
 -- Get terminal state (for debugging)
@@ -309,6 +348,6 @@ M._get_terminal = get_terminal
 M._set_active = function(id) active_id = id end
 M._get_active_id = function() return active_id end
 
-require("neovim-cursor.log").debug("terminal", "loaded")
+log.debug("terminal", "loaded")
 
 return M

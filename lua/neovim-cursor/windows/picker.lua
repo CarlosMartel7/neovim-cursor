@@ -12,8 +12,8 @@
 -- - Fuzzy search by agent name
 -- - Picker automatically reopens after rename for seamless workflow
 --
-local tabs = require("neovim-cursor.tabs")
-local terminal = require("neovim-cursor.terminal")
+local tabs = require("neovim-cursor.windows.tabs")
+local terminal = require("neovim-cursor.windows.terminal")
 
 local M = {}
 
