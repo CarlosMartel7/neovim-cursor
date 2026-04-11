@@ -16,6 +16,7 @@
 local M = {}
 local log = require("neovim-cursor.log")
 local buffer_keybindings = require("neovim-cursor.keybidings.buffer")
+local loading_overlay = require("neovim-cursor.windows.loading_overlay")
 
 -- State tracking for multiple terminals
 local terminals = {}  -- Table of terminal instances keyed by ID (stores buf, win, job_id)
@@ -29,6 +30,8 @@ local function cleanup_terminal(id, exit_code)
   if not term then
     return
   end
+
+  loading_overlay.dismiss(term)
 
   term.job_id = nil
 
@@ -92,6 +95,7 @@ local function hide(id)
   if is_visible(id) then
     local term = get_terminal(id)
     if term then
+      loading_overlay.dismiss(term)
       vim.api.nvim_win_hide(term.win)
       term.win = nil
     end
@@ -211,8 +215,29 @@ local function create_terminal_instance(id, config)
   -- Show the window
   show(id, config)
 
+  loading_overlay.attach(term, config)
+
+  local function handle_agent_activation(data)
+    if not data then
+      return
+    end
+
+    for _, chunk in ipairs(data) do
+      if chunk and chunk:match("%S") then
+        loading_overlay.on_agent_activated(term)
+        return
+      end
+    end
+  end
+
   -- Start the terminal
   term.job_id = vim.fn.termopen(config.command, {
+    on_stdout = function(_, data, _)
+      handle_agent_activation(data)
+    end,
+    on_stderr = function(_, data, _)
+      handle_agent_activation(data)
+    end,
     on_exit = function(_, exit_code, _)
       log.debug("terminal", "on_exit", { id = id, exit_code = exit_code })
       cleanup_terminal(id, exit_code)

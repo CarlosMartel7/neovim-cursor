@@ -26,6 +26,9 @@ M.defaults = {
 		hide_line_numbers = true,
 		-- When true, new agents can stay visible alongside existing ones (no auto-hide on switch)
 		multiple_windows = false,
+		-- Overlay with spinner until the agent PTY shows output (set false to disable)
+		loading_screen = true,
+		loading_message = "Starting Cursor agent…",
 	},
 
 	-- Terminal split configuration
