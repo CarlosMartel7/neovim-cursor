@@ -7,6 +7,37 @@ local log = require("neovim-cursor.log")
 local M = {}
 
 local SPINNER = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
+local ANSI_ESCAPE_PATTERN = "\27%[[0-9;?]*[ -/]*[@-~]"
+
+local function strip_ansi(s)
+	return (s:gsub(ANSI_ESCAPE_PATTERN, ""))
+end
+
+-- Only treat substantial terminal output as "agent is ready" activity.
+-- This prevents accidental dismissal when users press random keys while loading.
+function M.should_dismiss_from_data(data)
+	if type(data) ~= "table" then
+		return false
+	end
+
+	for _, chunk in ipairs(data) do
+		if type(chunk) == "string" then
+			local cleaned = strip_ansi(chunk):gsub("[%z\1-\31\127]", ""):gsub("%s+", "")
+			if #cleaned >= 8 then
+				return true
+			end
+		end
+	end
+
+	return false
+end
+
+function M.is_active(term)
+	return term
+		and term._loading_overlay
+		and term._loading_overlay.win
+		and vim.api.nvim_win_is_valid(term._loading_overlay.win)
+end
 
 function M.dismiss(term)
 	if not term or not term._loading_overlay then

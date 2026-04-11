@@ -88,6 +88,11 @@ function M.is_running(id)
   return false
 end
 
+function M.is_loading(id)
+  local term = get_terminal(id)
+  return loading_overlay.is_active(term) == true
+end
+
 -- Hide the terminal window
 local function hide(id)
   id = id or active_id or default_id
@@ -218,15 +223,8 @@ local function create_terminal_instance(id, config)
   loading_overlay.attach(term, config)
 
   local function handle_agent_activation(data)
-    if not data then
-      return
-    end
-
-    for _, chunk in ipairs(data) do
-      if chunk and chunk:match("%S") then
-        loading_overlay.on_agent_activated(term)
-        return
-      end
+    if loading_overlay.should_dismiss_from_data(data) then
+      loading_overlay.on_agent_activated(term)
     end
   end
 
