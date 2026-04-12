@@ -24,6 +24,27 @@ local active_id = nil  -- Currently active terminal ID
 local default_id = "default"  -- Default terminal ID for backward compatibility
 local cleanup_callbacks = {}  -- Callbacks to call when a terminal exits (used by tabs.lua for state sync)
 
+local function snapshot_modified_files()
+  local cwd = vim.fn.getcwd()
+  local output = vim.fn.systemlist("git -C " .. vim.fn.shellescape(cwd) .. " status --porcelain")
+  local files = {}
+
+  for _, line in ipairs(output) do
+    if line and line ~= "" then
+      local path = vim.trim(line:sub(4))
+      local rename_target = path:match(".* %-%> (.+)$")
+      if rename_target and rename_target ~= "" then
+        path = rename_target
+      end
+      if path ~= "" then
+        files[path] = true
+      end
+    end
+  end
+
+  return files
+end
+
 -- Centralized cleanup so on_exit and explicit delete stay in sync.
 local function cleanup_terminal(id, exit_code)
   local term = terminals[id]
@@ -154,8 +175,12 @@ local function show(id, config)
   -- Set window size
   if config.split.position == "right" or config.split.position == "left" then
     vim.api.nvim_win_set_width(term.win, size)
+    vim.api.nvim_win_set_option(term.win, "winfixheight", false)
+    vim.api.nvim_win_set_option(term.win, "winfixwidth", true)
   else
     vim.api.nvim_win_set_height(term.win, size)
+    vim.api.nvim_win_set_option(term.win, "winfixwidth", false)
+    vim.api.nvim_win_set_option(term.win, "winfixheight", true)
   end
 
   -- Optional: hide line-number column in the agent panel
@@ -209,10 +234,12 @@ local function create_terminal_instance(id, config)
       win = nil,
       job_id = nil,
       id = id,
+      modified_baseline = {},
     }
   end
 
   local term = terminals[id]
+  term.modified_baseline = snapshot_modified_files()
 
   -- Create a new buffer
   term.buf = vim.api.nvim_create_buf(false, true)
@@ -370,6 +397,10 @@ M._create_terminal_instance = create_terminal_instance
 M._get_terminal = get_terminal
 M._set_active = function(id) active_id = id end
 M._get_active_id = function() return active_id end
+M.get_modified_baseline = function(id)
+  local term = get_terminal(id)
+  return term and term.modified_baseline or nil
+end
 
 log.debug("terminal", "loaded")
 

@@ -14,6 +14,10 @@ M.defaults = {
 		delete = "<leader>aq", -- Delete current agent terminal
 		quick_question = "<leader>aq", -- Ask agent about the selection
 		quick_edit = "<leader>ae", -- Runs agent to edit the selection
+		modified_files = "<leader>af", -- Open picker for modified files
+		diff = "<leader>ad", -- Open diff viewer for agent sessions
+		change_location = "<leader>al", -- Change working directory for agent terminals
+		new_above = "<leader>aw", -- New agent terminal in split above current window
 		next_window = "<S-n>", -- Focus next split window
 		prev_window = "<S-l>", -- Focus previous split window
 	},
@@ -29,6 +33,8 @@ M.defaults = {
 		-- Overlay with spinner until the agent PTY shows output (set false to disable)
 		loading_screen = true,
 		loading_message = "Starting Cursor agent…",
+		-- Empty lines between main loading line and session warning (shrinks if window too short)
+		loading_overlay_gap = 3,
 	},
 
 	-- Terminal split configuration

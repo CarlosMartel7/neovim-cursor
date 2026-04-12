@@ -63,6 +63,14 @@ function M.new_terminal()
 	ctx.tabs.create_terminal(nil, ctx.config)
 end
 
+-- Create a new terminal in a horizontal split above the current window
+function M.new_terminal_above()
+	local config = vim.tbl_deep_extend("force", vim.deepcopy(ctx.config), {
+		split = { position = "top" },
+	})
+	ctx.tabs.create_terminal(nil, config)
+end
+
 -- Handler for creating a new terminal from within terminal mode
 -- By default hides the current terminal first so only one agent split is visible; with
 -- multiple_windows, keeps existing splits and opens another from the current window.
@@ -85,6 +93,10 @@ function M.select_terminal()
 			ctx.tabs.switch_to(selected_id, config)
 		end
 	end)
+end
+
+function M.modified_files()
+	ctx.picker.pick_modified_files()
 end
 
 -- Handler for renaming the active terminal
@@ -356,6 +368,31 @@ function M.quick_question()
 
 	quick_question_state.selection = selection
 	open_quick_question_float()
+end
+
+-- Handler for changing the working directory for all agent terminals.
+function M.change_location()
+	local tabs = ctx.tabs
+	local config = ctx.config
+	local current_cwd = tabs.get_agent_cwd()
+
+	vim.ui.input({
+		prompt = "Agent location: ",
+		default = current_cwd,
+		completion = "dir",
+	}, function(input)
+		if not input or vim.trim(input) == "" then
+			return
+		end
+
+		local new_path = vim.trim(input)
+		local ok, err = tabs.change_location(new_path, config)
+		if ok then
+			vim.notify("Agent terminals moved to: " .. vim.fn.fnamemodify(new_path, ":p"), vim.log.levels.INFO)
+		else
+			vim.notify("Could not change location: " .. (err or "unknown error"), vim.log.levels.ERROR)
+		end
+	end)
 end
 
 return M

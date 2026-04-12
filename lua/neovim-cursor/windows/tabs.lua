@@ -21,6 +21,7 @@ local state = {
 	active_id = nil, -- Currently active terminal ID (shown in window)
 	last_id = nil, -- Last active terminal ID (used for smart toggle with <leader>ai)
 	counter = 0, -- Counter for generating unique IDs (increments for each new terminal)
+	agent_cwd = nil, -- Shared working directory for all agent terminals (nil = vim cwd)
 }
 
 -- Register cleanup callback to sync when terminals exit
@@ -82,13 +83,30 @@ function M.create_terminal(name, config)
 		last_active = os.time(),
 	}
 
+	-- Spawn the process in the agent cwd if one is set.
+	local agent_dir = state.agent_cwd or vim.fn.getcwd()
+	local saved_cwd = vim.fn.getcwd()
+	if state.agent_cwd then
+		vim.fn.chdir(state.agent_cwd)
+	end
+
 	-- Create the actual terminal instance
 	terminal._create_terminal_instance(id, config)
+
+	if state.agent_cwd then
+		vim.fn.chdir(saved_cwd)
+	end
 
 	-- Set as active and last terminal
 	state.active_id = id
 	state.last_id = id
 	terminal._set_active(id)
+
+	-- Auto-start the diff watcher on worker.log for this project.
+	local ok_diff, diff_mod = pcall(require, "neovim-cursor.diff")
+	if ok_diff and diff_mod and diff_mod.start_watching then
+		diff_mod.start_watching(agent_dir)
+	end
 
 	return id
 end
@@ -234,7 +252,50 @@ function M.get_state()
 		last_id = state.last_id,
 		counter = state.counter,
 		count = M.count(),
+		agent_cwd = state.agent_cwd,
 	}
+end
+
+-- Get current agent cwd (falls back to vim cwd if not overridden).
+function M.get_agent_cwd()
+	return state.agent_cwd or vim.fn.getcwd()
+end
+
+-- Set a new agent cwd. Validates the path, then restarts all running terminals in it.
+-- @param new_path string Absolute or relative path to switch to
+-- @param config table Plugin config
+-- @return boolean, string  success, error_message
+function M.change_location(new_path, config)
+	local expanded = vim.fn.fnamemodify(new_path, ":p")
+	-- Strip trailing slash for consistency
+	expanded = expanded:gsub("[/\\]$", "")
+
+	if vim.fn.isdirectory(expanded) == 0 then
+		return false, "Not a valid directory: " .. expanded
+	end
+
+	state.agent_cwd = expanded
+
+	-- Restart every running terminal in the new location.
+	local saved_cwd = vim.fn.getcwd()
+	vim.fn.chdir(expanded)
+
+	local list = M.list_terminals()
+	for _, term_meta in ipairs(list) do
+		terminal.delete(term_meta.id)
+		state.terminals[term_meta.id] = nil
+	end
+	state.active_id = nil
+	state.last_id = nil
+
+	if #list > 0 then
+		for _, term_meta in ipairs(list) do
+			M.create_terminal(term_meta.name, config)
+		end
+	end
+
+	vim.fn.chdir(saved_cwd)
+	return true, nil
 end
 
 require("neovim-cursor.log").debug("tabs", "loaded")

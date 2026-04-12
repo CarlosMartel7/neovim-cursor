@@ -95,6 +95,8 @@ function M.attach(term, config)
 	local h = vim.api.nvim_win_get_height(anchor_win)
 
 	local message = tcfg.loading_message or "Starting Cursor agent…"
+	local cwd = vim.fn.getcwd()
+	local warn_text = "Be sure to be at the right location to retrieve your sessions later. You can use <Leader>al to change the agent location."
 
 	vim.api.nvim_set_hl(0, "NeovimCursorLoading", { default = true, link = "Normal" })
 
@@ -103,6 +105,81 @@ function M.attach(term, config)
 	vim.bo[obuf].modifiable = true
 
 	local spinner_i = 1
+	local gap_after_main = tcfg.loading_overlay_gap or 3
+
+	-- Break string into lines each with display width <= max_w (no ellipsis).
+	local function wrap_hard(s, max_w)
+		local out = {}
+		if max_w < 1 or s == "" then
+			return out
+		end
+		local pos = 0
+		local total = vim.fn.strchars(s)
+		while pos < total do
+			local low, high = 1, total - pos
+			local best = 1
+			while low <= high do
+				local mid = math.floor((low + high) / 2)
+				local sub = vim.fn.strcharpart(s, pos, mid)
+				if vim.fn.strdisplaywidth(sub) <= max_w then
+					best = mid
+					low = mid + 1
+				else
+					high = mid - 1
+				end
+			end
+			local line = vim.fn.strcharpart(s, pos, best)
+			table.insert(out, line)
+			pos = pos + best
+		end
+		return out
+	end
+
+	local function wrap_words(text, max_w)
+		local lines = {}
+		local line = ""
+		for word in string.gmatch(text, "%S+") do
+			local candidate = line == "" and word or (line .. " " .. word)
+			if vim.fn.strdisplaywidth(candidate) <= max_w then
+				line = candidate
+			else
+				if line ~= "" then
+					table.insert(lines, line)
+				end
+				if vim.fn.strdisplaywidth(word) > max_w then
+					vim.list_extend(lines, wrap_hard(word, max_w))
+					line = ""
+				else
+					line = word
+				end
+			end
+		end
+		if line ~= "" then
+			table.insert(lines, line)
+		end
+		return lines
+	end
+
+	local function center_line_text(text)
+		local dw = vim.fn.strdisplaywidth(text)
+		local pad = math.max(0, math.floor((w - dw) / 2))
+		return string.rep(" ", pad) .. text
+	end
+
+	local function build_block(spin, gap)
+		local max_text_w = math.max(4, w - 2)
+		local main = string.format("  %s  %s", spin, message)
+		local blk = { center_line_text(main) }
+		for _ = 1, gap do
+			table.insert(blk, "")
+		end
+		vim.list_extend(blk, vim.tbl_map(center_line_text, wrap_words(warn_text, max_text_w)))
+		table.insert(blk, "")
+		table.insert(blk, center_line_text("Opening at:"))
+		vim.list_extend(blk, vim.tbl_map(center_line_text, wrap_words(cwd, max_text_w)))
+		return blk
+	end
+
 	local function redraw()
 		if not vim.api.nvim_buf_is_valid(obuf) then
 			return
@@ -114,14 +191,30 @@ function M.attach(term, config)
 		local spin = SPINNER[spinner_i]
 		spinner_i = spinner_i % #SPINNER + 1
 		local lines = {}
-		local mid = math.max(1, math.floor(h / 2))
 		for r = 1, h do
-			if r == mid then
-				local text = string.format("  %s  %s", spin, message)
-				local pad = math.max(0, math.floor((w - vim.fn.strdisplaywidth(text)) / 2))
-				lines[r] = string.rep(" ", pad) .. text
-			else
-				lines[r] = ""
+			lines[r] = ""
+		end
+		local gap = math.max(0, gap_after_main)
+		local block
+		repeat
+			block = build_block(spin, gap)
+			if #block <= h or gap == 0 then
+				break
+			end
+			gap = gap - 1
+		until false
+		if #block > h then
+			local clipped = {}
+			for i = 1, h do
+				clipped[i] = block[i]
+			end
+			block = clipped
+		end
+		local start_row = math.max(1, math.floor((h - #block) / 2) + 1)
+		for i = 1, #block do
+			local r = start_row + i - 1
+			if r <= h then
+				lines[r] = block[i]
 			end
 		end
 		vim.api.nvim_buf_set_lines(obuf, 0, -1, false, lines)

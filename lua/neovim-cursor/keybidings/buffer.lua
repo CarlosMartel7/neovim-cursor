@@ -12,13 +12,14 @@ local function open_agent_help(next_w, prev_w)
 		"  " .. prev_w .. "      Focus previous window",
 		"  <C-n>      Create new agent terminal",
 		"  <C-t>      Select agent terminal",
-		"  <C-r>      Rename current agent terminal",
+		"  <C-l>      Rename current agent terminal",
 		"",
 		"Normal mode (inside terminal buffer):",
 		"  ?          Open this help menu",
 		"  w          Leave agent window",
 		"  d          Delete current agent window",
 		"  q          Hide/quit agent window",
+		"  l          Change agent terminal location",
 		"  i          Enter insert mode inside of the promp field.",
 		"",
 		"Press q or <Esc> to close this help.",
@@ -117,7 +118,7 @@ function M.setup_agent_terminal_buffer(bufnr, keybindings)
 	vim.api.nvim_buf_set_keymap(
 		bufnr,
 		"t",
-		"<C-r>",
+		"<C-l>",
 		'<C-\\><C-n>:lua require("neovim-cursor").rename_terminal_handler()<CR>',
 		{
 			noremap = true,
@@ -154,6 +155,12 @@ function M.setup_agent_terminal_buffer(bufnr, keybindings)
 		noremap = true,
 		silent = true,
 		desc = "Quit agent window",
+	})
+
+	vim.api.nvim_buf_set_keymap(bufnr, "n", "l", '<Cmd>lua require("neovim-cursor").change_location_handler()<CR>', {
+		noremap = true,
+		silent = true,
+		desc = "Change agent terminal location",
 	})
 
 	vim.keymap.set("n", "?", function()

@@ -11,11 +11,17 @@ local keybindings = {
 	rename = "<leader>ar",
 	delete = "<leader>aq",
 	quick_question = "<leader>aq",
+	modified_files = "<leader>af",
+	diff = "<leader>ad",
+	change_location = "<leader>al",
+	new_above = "<leader>aw",
 	next_window = "<S-n>",
 	prev_window = "<S-l>",
 }
 
-function M.setup_global()
+function M.setup_global(user_keybindings)
+	keybindings = vim.tbl_deep_extend("force", keybindings, user_keybindings or {})
+
 	vim.keymap.set("n", keybindings.toggle, handlers.normal_mode, {
 		desc = "Toggle Cursor Agent terminal",
 		silent = true,
@@ -34,6 +40,11 @@ function M.setup_global()
 		silent = true,
 	})
 
+	vim.keymap.set("n", keybindings.new_above, handlers.new_terminal_above, {
+		desc = "Create new Cursor Agent terminal above current window",
+		silent = true,
+	})
+
 	vim.keymap.set("n", keybindings.select, handlers.select_terminal, {
 		desc = "Select Cursor Agent terminal",
 		silent = true,
@@ -46,6 +57,23 @@ function M.setup_global()
 
 	vim.keymap.set("n", keybindings.delete, handlers.delete_terminal, {
 		desc = "Delete Cursor Agent terminal",
+		silent = true,
+	})
+
+	vim.keymap.set("n", keybindings.modified_files, handlers.modified_files, {
+		desc = "Open modified files picker",
+		silent = true,
+	})
+
+	vim.keymap.set("n", keybindings.diff, function()
+		require("neovim-cursor.diff").open()
+	end, {
+		desc = "Open diff viewer for agent sessions",
+		silent = true,
+	})
+
+	vim.keymap.set("n", keybindings.change_location, handlers.change_location, {
+		desc = "Change working directory for agent terminals",
 		silent = true,
 	})
 
