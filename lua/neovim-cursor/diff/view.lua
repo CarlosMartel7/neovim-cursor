@@ -1,428 +1,411 @@
--- Diff review UI: file list + side-by-side diff with extmark highlights.
+-- Two-panel diff viewer for pending ACP changes.
 --
--- Layout:
---   [file list]  |  [diff view]
---   narrow left     wide right
+-- Layout (opened with :CursorDiff):
 --
--- Keymaps (in diff view):
---   a / <leader>a   Accept current hunk (mark green)
---   r / <leader>r   Reject current hunk (revert on disk, mark red)
---   q               Close diff view
---   <CR> in file list   Show diff for that file
+--   ┌─────────────────────────┬──────────────────────────────────────┐
+--   │  Changes (left panel)   │  Diff preview (right panel)          │
+--   │  Turn 1  "prompt text"  │  --- a/src/foo.lua                   │
+--   │   ▸ src/foo.lua [pend]  │  +++ b/src/foo.lua                   │
+--   │   ▸ src/bar.lua [pend]  │  @@ -1,3 +1,4 @@                    │
+--   │  Turn 2  "next prompt"  │   line 1                             │
+--   │   ▸ src/main.lua [acc]  │  +new line                           │
+--   └─────────────────────────┴──────────────────────────────────────┘
+--
+-- Keymaps (left panel):
+--   ga   accept change under cursor
+--   gr   reject change under cursor
+--   gA   accept all pending changes in the file under cursor
+--   gR   reject all pending changes in the file under cursor
+--   q    close viewer
 
-local actions_mod = require("neovim-cursor.diff.actions")
-local diff_state = require("neovim-cursor.diff.state")
-local log = require("neovim-cursor.log")
+local db      = require("neovim-cursor.acp.db")
+local actions = require("neovim-cursor.diff.actions")
 
 local M = {}
 
-local ns = vim.api.nvim_create_namespace("neovim_cursor_diff")
+-- ---------------------------------------------------------------------------
+-- State (one viewer at a time)
+-- ---------------------------------------------------------------------------
 
-local function setup_highlights()
-	vim.api.nvim_set_hl(0, "CursorDiffAccepted", { default = true, bg = "#1a3a1a" })
-	vim.api.nvim_set_hl(0, "CursorDiffRejected", { default = true, bg = "#3a1a1a" })
-	vim.api.nvim_set_hl(0, "CursorDiffAdd", { default = true, bg = "#1a2a1a" })
-	vim.api.nvim_set_hl(0, "CursorDiffDel", { default = true, bg = "#2a1a1a" })
-	vim.api.nvim_set_hl(0, "CursorDiffFileHeader", { default = true, bold = true, underline = true })
-	vim.api.nvim_set_hl(0, "CursorDiffTurnHeader", { default = true, bold = true, fg = "#7aa2f7" })
-end
-
-local function get_file_icon(path)
-	local ok, devicons = pcall(require, "nvim-web-devicons")
-	if not ok or not devicons then
-		return "", "Normal"
-	end
-	local filename = vim.fn.fnamemodify(path, ":t")
-	local extension = vim.fn.fnamemodify(path, ":e")
-	local icon, hl = devicons.get_icon(filename, extension, { default = true })
-	return icon or "", hl or "Normal"
-end
-
--- Read current file content from disk (returns string or nil for new files).
-local function read_file(path)
-	local f = io.open(path, "r")
-	if not f then
-		return nil
-	end
-	local content = f:read("*a")
-	f:close()
-	return content
-end
-
--- Build the old/new text pair for an edit so we can diff them.
-local function build_diff_pair(edit)
-	if edit.type == "str_replace" then
-		return edit.old_string, edit.new_string
-	elseif edit.type == "write" then
-		local current = read_file(edit.path)
-		return current or "", edit.content
-	elseif edit.type == "apply_patch" then
-		return "(patch content — see raw patch below)", edit.patch
-	end
-	return "", ""
-end
-
--- View-local rendering state (buffers, windows, cursor tracking).
-local view = {
-	file_buf = nil,
-	file_win = nil,
-	diff_buf = nil,
-	diff_win = nil,
-	file_order = {},
-	by_file = {},
-	current_file = nil,
-	hunk_ranges = {},
-	state_listener_id = nil,
+local state = {
+  left_buf    = nil,
+  right_buf   = nil,
+  left_win    = nil,
+  right_win   = nil,
+  -- Ordered list of display items.  Each item is either:
+  --   { kind = "header", turn, prompt }   (turn group heading)
+  --   { kind = "change", change }         (a change row)
+  items       = {},
+  -- Maps left-panel line number (1-based) → item index in state.items
+  line_to_item = {},
+  cwd         = nil,
 }
 
-local function close_view()
-	local bufs = { view.file_buf, view.diff_buf }
-	local wins = { view.file_win, view.diff_win }
+-- ---------------------------------------------------------------------------
+-- Helpers
+-- ---------------------------------------------------------------------------
 
-	for _, w in ipairs(wins) do
-		if w and vim.api.nvim_win_is_valid(w) then
-			pcall(vim.api.nvim_win_close, w, true)
-		end
-	end
-	for _, b in ipairs(bufs) do
-		if b and vim.api.nvim_buf_is_valid(b) then
-			pcall(vim.api.nvim_buf_delete, b, { force = true })
-		end
-	end
+local STATUS_LABEL = {
+  pending  = "[pending]",
+  accepted = "[accepted]",
+  rejected = "[rejected]",
+}
 
-	view.file_buf = nil
-	view.file_win = nil
-	view.diff_buf = nil
-	view.diff_win = nil
+local function short_path(path, cwd)
+  if cwd and path:sub(1, #cwd) == cwd then
+    local rel = path:sub(#cwd + 1)
+    -- strip leading slash
+    return rel:gsub("^[/\\]", "")
+  end
+  return vim.fn.fnamemodify(path, ":.")
 end
 
--- Rebuild the file-centric grouping from state.
-local function sync_from_state()
-	view.by_file, view.file_order = diff_state.all_edits_by_file()
+-- Build the lines + line→item map from the current DB state.
+local function build_display(cwd)
+  local rows = db.get_all(cwd)
+
+  -- Group rows by turn_number
+  local turns = {}
+  local turn_order = {}
+  for _, row in ipairs(rows) do
+    local t = row.turn_number or 0
+    if not turns[t] then
+      turns[t] = { prompt = row.prompt_text or "", changes = {} }
+      table.insert(turn_order, t)
+    end
+    table.insert(turns[t].changes, row)
+  end
+  table.sort(turn_order)
+
+  local items       = {}
+  local lines       = {}
+  local line_to_item = {}
+
+  for _, t in ipairs(turn_order) do
+    local grp    = turns[t]
+    local prompt = grp.prompt ~= "" and ('"' .. grp.prompt .. '"') or "(no prompt)"
+    local header = string.format("Turn %d  %s", t, prompt)
+    table.insert(items, { kind = "header", turn = t, prompt = grp.prompt })
+    table.insert(lines, header)
+    line_to_item[#lines] = #items
+
+    for _, change in ipairs(grp.changes) do
+      local label = string.format(
+        "  ▸ %-50s %s",
+        short_path(change.file_path, cwd),
+        STATUS_LABEL[change.status] or ""
+      )
+      table.insert(items, { kind = "change", change = change })
+      table.insert(lines, label)
+      line_to_item[#lines] = #items
+    end
+
+    -- Blank separator between turns
+    table.insert(items, { kind = "sep" })
+    table.insert(lines, "")
+    -- sep line maps to nothing meaningful
+  end
+
+  return lines, items, line_to_item
 end
 
-local function render_file_list()
-	if not view.file_buf or not vim.api.nvim_buf_is_valid(view.file_buf) then
-		return
-	end
+-- Render the right panel with the unified diff for a change.
+local function render_diff(change)
+  if not (state.right_buf and vim.api.nvim_buf_is_valid(state.right_buf)) then
+    return
+  end
 
-	sync_from_state()
+  if not change then
+    vim.api.nvim_buf_set_lines(state.right_buf, 0, -1, false, { "-- no change selected --" })
+    return
+  end
 
-	local lines = {}
-	for _, fp in ipairs(view.file_order) do
-		local entries = view.by_file[fp] or {}
-		local accepted = 0
-		local rejected = 0
-		local pending = 0
-		for _, entry in ipairs(entries) do
-			local s = diff_state.get_status(entry.edit)
-			if s == "accepted" then
-				accepted = accepted + 1
-			elseif s == "rejected" then
-				rejected = rejected + 1
-			else
-				pending = pending + 1
-			end
-		end
+  local old = change.old_text or ""
+  local new = change.new_text or ""
 
-		local icon, _ = get_file_icon(fp)
-		local short = vim.fn.fnamemodify(fp, ":~:.")
-		local status_str = ""
-		if pending == 0 then
-			status_str = (rejected > 0 and accepted > 0) and " [partial]"
-				or (accepted > 0 and " [done]" or " [rejected]")
-		else
-			status_str = string.format(" [%d/%d]", accepted + rejected, #entries)
-		end
-		table.insert(lines, string.format("%s %s%s", icon, short, status_str))
-	end
+  local diff_text = vim.diff(old, new, {
+    result_type = "unified",
+    algorithm   = "histogram",
+    ctxlen      = 5,
+  }) or ""
 
-	vim.bo[view.file_buf].modifiable = true
-	vim.api.nvim_buf_set_lines(view.file_buf, 0, -1, false, lines)
-	vim.bo[view.file_buf].modifiable = false
+  local diff_lines = vim.split(diff_text, "\n", { plain = true })
+
+  -- Prepend file header lines that vim.diff omits
+  local header = {
+    "--- a/" .. (change.file_path or ""),
+    "+++ b/" .. (change.file_path or ""),
+  }
+  -- Only add them if vim.diff didn't produce its own
+  if #diff_lines == 0 or not diff_lines[1]:match("^---") then
+    for i, h in ipairs(header) do
+      table.insert(diff_lines, i, h)
+    end
+  end
+
+  vim.bo[state.right_buf].modifiable = true
+  vim.api.nvim_buf_set_lines(state.right_buf, 0, -1, false, diff_lines)
+  vim.bo[state.right_buf].modifiable = false
 end
 
-local function render_diff(filepath)
-	if not view.diff_buf or not vim.api.nvim_buf_is_valid(view.diff_buf) then
-		return
-	end
+-- Re-render the left panel from the DB and rebuild the internal maps.
+local function refresh(keep_cursor)
+  if not (state.left_buf and vim.api.nvim_buf_is_valid(state.left_buf)) then
+    return
+  end
 
-	view.current_file = filepath
-	view.hunk_ranges = {}
-	vim.api.nvim_buf_clear_namespace(view.diff_buf, ns, 0, -1)
+  local cursor_line = 1
+  if keep_cursor and state.left_win and vim.api.nvim_win_is_valid(state.left_win) then
+    cursor_line = vim.api.nvim_win_get_cursor(state.left_win)[1]
+  end
 
-	local file_entries = view.by_file[filepath] or {}
-	local lines = {}
-	local short = vim.fn.fnamemodify(filepath, ":~:.")
-	table.insert(lines, "File: " .. short)
-	table.insert(lines, string.rep("─", 60))
-	table.insert(lines, "")
+  local lines, items, line_to_item = build_display(state.cwd)
+  state.items        = items
+  state.line_to_item = line_to_item
 
-	-- Track which turn header we last rendered to avoid duplicates.
-	local last_turn_num = nil
-	local edit_counter = 0
+  vim.bo[state.left_buf].modifiable = true
+  vim.api.nvim_buf_set_lines(state.left_buf, 0, -1, false, lines)
+  vim.bo[state.left_buf].modifiable = false
 
-	for _, entry in ipairs(file_entries) do
-		local edit = entry.edit
-		local turn = entry.turn
-		edit_counter = edit_counter + 1
-
-		-- Render turn separator when we enter a new turn.
-		if turn and turn.turn_num ~= last_turn_num then
-			last_turn_num = turn.turn_num
-			local turn_label = string.format(
-				"════ Turn %d: %s ════",
-				turn.turn_num,
-				turn.prompt
-			)
-			table.insert(lines, turn_label)
-			table.insert(lines, "")
-		end
-
-		local hunk_start = #lines
-		local status = diff_state.get_status(edit) or "pending"
-		local header = string.format(
-			"── Edit %d [%s] ── %s",
-			edit_counter,
-			status,
-			edit.type
-		)
-		table.insert(lines, header)
-		table.insert(lines, "")
-
-		local old_text, new_text = build_diff_pair(edit)
-		local diff_str = actions_mod.compute_diff(old_text, new_text)
-
-		if diff_str ~= "" then
-			for _, dl in ipairs(vim.split(diff_str, "\n")) do
-				table.insert(lines, dl)
-			end
-		else
-			table.insert(lines, "(no diff)")
-		end
-
-		table.insert(lines, "")
-		local hunk_end = #lines - 1
-
-		table.insert(view.hunk_ranges, {
-			edit = edit,
-			edit_index = edit_counter,
-			start_line = hunk_start,
-			end_line = hunk_end,
-		})
-	end
-
-	if #file_entries == 0 then
-		table.insert(lines, "(no edits for this file)")
-	end
-
-	vim.bo[view.diff_buf].modifiable = true
-	vim.api.nvim_buf_set_lines(view.diff_buf, 0, -1, false, lines)
-	vim.bo[view.diff_buf].modifiable = false
-
-	-- Diff line highlights.
-	for lnum = 0, #lines - 1 do
-		local line = lines[lnum + 1]
-		if line:match("^%+") and not line:match("^%+%+%+") then
-			vim.api.nvim_buf_add_highlight(view.diff_buf, ns, "CursorDiffAdd", lnum, 0, -1)
-		elseif line:match("^%-") and not line:match("^%-%-%-") then
-			vim.api.nvim_buf_add_highlight(view.diff_buf, ns, "CursorDiffDel", lnum, 0, -1)
-		elseif line:match("^── Edit") then
-			vim.api.nvim_buf_add_highlight(view.diff_buf, ns, "CursorDiffFileHeader", lnum, 0, -1)
-		elseif line:match("^════ Turn") then
-			vim.api.nvim_buf_add_highlight(view.diff_buf, ns, "CursorDiffTurnHeader", lnum, 0, -1)
-		end
-	end
-
-	M._apply_status_highlights()
+  -- Restore / clamp cursor
+  local max_line = math.max(1, #lines)
+  cursor_line    = math.min(cursor_line, max_line)
+  if state.left_win and vim.api.nvim_win_is_valid(state.left_win) then
+    vim.api.nvim_win_set_cursor(state.left_win, { cursor_line, 0 })
+  end
 end
 
-function M._apply_status_highlights()
-	for _, hunk in ipairs(view.hunk_ranges) do
-		local status = diff_state.get_status(hunk.edit)
-		local hl = nil
-		if status == "accepted" then
-			hl = "CursorDiffAccepted"
-		elseif status == "rejected" then
-			hl = "CursorDiffRejected"
-		end
-		if hl then
-			for lnum = hunk.start_line, math.min(hunk.end_line, vim.api.nvim_buf_line_count(view.diff_buf) - 1) do
-				vim.api.nvim_buf_add_highlight(view.diff_buf, ns, hl, lnum, 0, -1)
-			end
-		end
-	end
+-- Return the change row under the cursor in the left panel, or nil.
+local function change_at_cursor()
+  if not (state.left_win and vim.api.nvim_win_is_valid(state.left_win)) then
+    return nil
+  end
+  local line = vim.api.nvim_win_get_cursor(state.left_win)[1]
+  local idx  = state.line_to_item[line]
+  if not idx then return nil end
+  local item = state.items[idx]
+  if item and item.kind == "change" then
+    return item.change
+  end
+  return nil
 end
 
-local function get_hunk_at_cursor()
-	if not view.diff_win or not vim.api.nvim_win_is_valid(view.diff_win) then
-		return nil
-	end
-	local cursor = vim.api.nvim_win_get_cursor(view.diff_win)
-	local row = cursor[1] - 1
-
-	for _, hunk in ipairs(view.hunk_ranges) do
-		if row >= hunk.start_line and row <= hunk.end_line then
-			return hunk
-		end
-	end
-	return nil
+-- Close the viewer and clean up.
+local function close()
+  if state.left_win  and vim.api.nvim_win_is_valid(state.left_win)  then
+    vim.api.nvim_win_close(state.left_win, true)
+  end
+  if state.right_win and vim.api.nvim_win_is_valid(state.right_win) then
+    vim.api.nvim_win_close(state.right_win, true)
+  end
+  -- Buffers are wiped via bufhidden=wipe
+  state.left_buf    = nil
+  state.right_buf   = nil
+  state.left_win    = nil
+  state.right_win   = nil
+  state.items       = {}
+  state.line_to_item = {}
 end
 
-local function accept_hunk()
-	local hunk = get_hunk_at_cursor()
-	if not hunk then
-		vim.notify("No hunk under cursor", vim.log.levels.WARN)
-		return
-	end
-	if diff_state.get_status(hunk.edit) then
-		vim.notify("Hunk already " .. diff_state.get_status(hunk.edit), vim.log.levels.INFO)
-		return
-	end
+-- ---------------------------------------------------------------------------
+-- Keymaps
+-- ---------------------------------------------------------------------------
 
-	actions_mod.accept(hunk.edit)
-	diff_state.set_status(hunk.edit, "accepted")
-	vim.notify(
-		"Accepted edit " .. hunk.edit_index .. " on " .. vim.fn.fnamemodify(hunk.edit.path, ":t"),
-		vim.log.levels.INFO
-	)
-	render_diff(view.current_file)
-	render_file_list()
+local function setup_keymaps(buf, cwd)
+  local opts = { noremap = true, silent = true, buffer = buf }
+
+  -- ga: accept change under cursor
+  vim.keymap.set("n", "ga", function()
+    local change = change_at_cursor()
+    if not change then
+      vim.notify("[neovim-cursor] No change under cursor", vim.log.levels.WARN)
+      return
+    end
+    if change.status ~= "pending" then
+      vim.notify("[neovim-cursor] Change is already " .. change.status, vim.log.levels.INFO)
+      return
+    end
+    if actions.accept(change) then
+      vim.notify("[neovim-cursor] Accepted: " .. change.file_path, vim.log.levels.INFO)
+      refresh(true)
+      render_diff(change_at_cursor())
+    end
+  end, opts)
+
+  -- gr: reject change under cursor
+  vim.keymap.set("n", "gr", function()
+    local change = change_at_cursor()
+    if not change then
+      vim.notify("[neovim-cursor] No change under cursor", vim.log.levels.WARN)
+      return
+    end
+    if change.status ~= "pending" then
+      vim.notify("[neovim-cursor] Change is already " .. change.status, vim.log.levels.INFO)
+      return
+    end
+    if actions.reject(change) then
+      vim.notify("[neovim-cursor] Rejected: " .. change.file_path, vim.log.levels.INFO)
+      refresh(true)
+      render_diff(change_at_cursor())
+    end
+  end, opts)
+
+  -- gA: accept all pending changes for the file under cursor
+  vim.keymap.set("n", "gA", function()
+    local change = change_at_cursor()
+    if not change then
+      vim.notify("[neovim-cursor] No change under cursor", vim.log.levels.WARN)
+      return
+    end
+    local count = actions.accept_all_in_file(change.file_path, cwd)
+    vim.notify(
+      string.format("[neovim-cursor] Accepted %d change(s) in %s", count, change.file_path),
+      vim.log.levels.INFO
+    )
+    refresh(true)
+    render_diff(change_at_cursor())
+  end, opts)
+
+  -- gR: reject all pending changes for the file under cursor
+  vim.keymap.set("n", "gR", function()
+    local change = change_at_cursor()
+    if not change then
+      vim.notify("[neovim-cursor] No change under cursor", vim.log.levels.WARN)
+      return
+    end
+    local count = actions.reject_all_in_file(change.file_path, cwd)
+    vim.notify(
+      string.format("[neovim-cursor] Rejected %d change(s) in %s", count, change.file_path),
+      vim.log.levels.INFO
+    )
+    refresh(true)
+    render_diff(change_at_cursor())
+  end, opts)
+
+  -- q: close viewer
+  vim.keymap.set("n", "q", close, opts)
 end
 
-local function reject_hunk()
-	local hunk = get_hunk_at_cursor()
-	if not hunk then
-		vim.notify("No hunk under cursor", vim.log.levels.WARN)
-		return
-	end
-	if diff_state.get_status(hunk.edit) then
-		vim.notify("Hunk already " .. diff_state.get_status(hunk.edit), vim.log.levels.INFO)
-		return
-	end
+-- ---------------------------------------------------------------------------
+-- Public open() function
+-- ---------------------------------------------------------------------------
 
-	local ok = actions_mod.reject(hunk.edit)
-	if ok then
-		diff_state.set_status(hunk.edit, "rejected")
-		vim.notify(
-			"Rejected edit " .. hunk.edit_index .. " on " .. vim.fn.fnamemodify(hunk.edit.path, ":t"),
-			vim.log.levels.INFO
-		)
-	else
-		vim.notify("Could not revert edit " .. hunk.edit_index, vim.log.levels.ERROR)
-	end
-	render_diff(view.current_file)
-	render_file_list()
+-- Open the two-panel diff viewer.
+-- @param opts table?  { cwd?: string }  defaults to vim.fn.getcwd()
+function M.open(opts)
+  opts = opts or {}
+  local cwd = opts.cwd
+    or (vim.fn.getcwd and vim.fn.getcwd())
+    or vim.loop.cwd()
+  cwd = vim.fn.fnamemodify(cwd, ":p"):gsub("[/\\]$", "")
+
+  -- If already open, just focus the left window.
+  if state.left_win and vim.api.nvim_win_is_valid(state.left_win) then
+    vim.api.nvim_set_current_win(state.left_win)
+    return
+  end
+
+  state.cwd = cwd
+
+  -- Create right (diff preview) buffer first, then split left.
+  state.right_buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[state.right_buf].buftype    = "nofile"
+  vim.bo[state.right_buf].bufhidden  = "wipe"
+  vim.bo[state.right_buf].swapfile   = false
+  vim.bo[state.right_buf].filetype   = "diff"
+  vim.bo[state.right_buf].modifiable = false
+  vim.api.nvim_buf_set_name(state.right_buf, "CursorDiff:preview")
+
+  -- Open a new tab so we don't disturb the editor layout.
+  vim.cmd("tabnew")
+  state.right_win = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(state.right_win, state.right_buf)
+
+  -- Split left panel (40 columns wide)
+  vim.cmd("leftabove vsplit")
+  state.left_win = vim.api.nvim_get_current_win()
+
+  state.left_buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_win_set_buf(state.left_win, state.left_buf)
+  vim.bo[state.left_buf].buftype    = "nofile"
+  vim.bo[state.left_buf].bufhidden  = "wipe"
+  vim.bo[state.left_buf].swapfile   = false
+  vim.bo[state.left_buf].filetype   = ""
+  vim.bo[state.left_buf].modifiable = false
+  vim.api.nvim_buf_set_name(state.left_buf, "CursorDiff:changes")
+
+  -- Resize left panel
+  vim.api.nvim_win_set_width(state.left_win, 60)
+
+  -- Window-local options for the left panel
+  vim.wo[state.left_win].number         = false
+  vim.wo[state.left_win].relativenumber = false
+  vim.wo[state.left_win].wrap           = false
+  vim.wo[state.left_win].cursorline     = true
+  vim.wo[state.left_win].signcolumn     = "no"
+
+  -- Window-local options for the right panel
+  vim.wo[state.right_win].number         = false
+  vim.wo[state.right_win].relativenumber = false
+  vim.wo[state.right_win].wrap           = false
+  vim.wo[state.right_win].signcolumn     = "no"
+
+  -- Set the tab title
+  vim.api.nvim_buf_set_name(state.left_buf, "CursorDiff:changes")
+
+  -- Populate left panel
+  refresh(false)
+
+  -- Set up keymaps
+  setup_keymaps(state.left_buf, cwd)
+
+  -- Update diff preview when cursor moves in the left panel.
+  local au_group = vim.api.nvim_create_augroup("NeovimCursorDiffView", { clear = true })
+  vim.api.nvim_create_autocmd({ "CursorMoved", "CursorHold" }, {
+    buffer  = state.left_buf,
+    group   = au_group,
+    callback = function()
+      render_diff(change_at_cursor())
+    end,
+  })
+
+  -- Cleanup state when the buffer is wiped.
+  vim.api.nvim_create_autocmd("BufWipeout", {
+    buffer  = state.left_buf,
+    group   = au_group,
+    once    = true,
+    callback = function()
+      state.left_buf    = nil
+      state.left_win    = nil
+      state.items       = {}
+      state.line_to_item = {}
+    end,
+  })
+  vim.api.nvim_create_autocmd("BufWipeout", {
+    buffer  = state.right_buf,
+    group   = au_group,
+    once    = true,
+    callback = function()
+      state.right_buf = nil
+      state.right_win = nil
+    end,
+  })
+
+  -- Show diff for first item immediately.
+  render_diff(change_at_cursor())
+
+  -- Focus left panel
+  vim.api.nvim_set_current_win(state.left_win)
+
+  if #state.items == 0 then
+    vim.notify("[neovim-cursor] No changes recorded for this project.", vim.log.levels.INFO)
+  end
 end
 
-local function select_file_at_cursor()
-	if not view.file_win or not vim.api.nvim_win_is_valid(view.file_win) then
-		return
-	end
-	local cursor = vim.api.nvim_win_get_cursor(view.file_win)
-	local idx = cursor[1]
-	if idx <= #view.file_order then
-		render_diff(view.file_order[idx])
-		if view.diff_win and vim.api.nvim_win_is_valid(view.diff_win) then
-			vim.api.nvim_set_current_win(view.diff_win)
-		end
-	end
+-- Reload the left panel contents (called after external DB updates).
+function M.refresh()
+  refresh(true)
+  render_diff(change_at_cursor())
 end
-
---- Refresh the view in-place when state changes (e.g. new turn arrived).
-local function refresh_view()
-	if not view.diff_buf or not vim.api.nvim_buf_is_valid(view.diff_buf) then
-		return
-	end
-	sync_from_state()
-	render_file_list()
-	if view.current_file then
-		render_diff(view.current_file)
-	end
-end
-
---- Open the diff review view.
---- @param session table|nil If provided, loads edits from this session into state.
----   When nil, shows whatever is already in diff_state (watcher flow).
-function M.open(session)
-	setup_highlights()
-	close_view()
-
-	if session then
-		diff_state.reset()
-		diff_state.set_session_id(session.id)
-
-		local parser = require("neovim-cursor.diff.parser")
-		local turns = parser.parse_turns(session.path)
-		for _, turn in ipairs(turns) do
-			diff_state.add_turn(turn.edits, turn.prompt)
-		end
-	end
-
-	local turns = diff_state.get_turns()
-	if #turns == 0 then
-		local msg = session and ("No file edits found in session " .. session.id)
-			or "No pending edits to review"
-		vim.notify(msg, vim.log.levels.INFO)
-		return
-	end
-
-	sync_from_state()
-	view.current_file = view.file_order[1]
-
-	-- File list buffer (left, narrow)
-	view.file_buf = vim.api.nvim_create_buf(false, true)
-	vim.bo[view.file_buf].bufhidden = "wipe"
-	vim.bo[view.file_buf].buftype = "nofile"
-	vim.bo[view.file_buf].swapfile = false
-
-	-- Diff buffer (right, wide)
-	view.diff_buf = vim.api.nvim_create_buf(false, true)
-	vim.bo[view.diff_buf].bufhidden = "wipe"
-	vim.bo[view.diff_buf].buftype = "nofile"
-	vim.bo[view.diff_buf].swapfile = false
-	vim.bo[view.diff_buf].filetype = "diff"
-
-	-- Create layout: vertical split
-	vim.cmd("botright vnew")
-	view.diff_win = vim.api.nvim_get_current_win()
-	vim.api.nvim_win_set_buf(view.diff_win, view.diff_buf)
-
-	vim.cmd("leftabove vnew")
-	view.file_win = vim.api.nvim_get_current_win()
-	vim.api.nvim_win_set_buf(view.file_win, view.file_buf)
-	vim.api.nvim_win_set_width(view.file_win, 35)
-	vim.wo[view.file_win].winfixwidth = true
-	vim.wo[view.file_win].number = false
-	vim.wo[view.file_win].relativenumber = false
-	vim.wo[view.file_win].cursorline = true
-
-	vim.wo[view.diff_win].number = false
-	vim.wo[view.diff_win].relativenumber = false
-	vim.wo[view.diff_win].wrap = false
-
-	render_file_list()
-	render_diff(view.current_file)
-
-	-- File list keymaps
-	vim.keymap.set("n", "<CR>", select_file_at_cursor, { buffer = view.file_buf, silent = true })
-	vim.keymap.set("n", "q", close_view, { buffer = view.file_buf, silent = true })
-
-	-- Diff view keymaps
-	vim.keymap.set("n", "a", accept_hunk, { buffer = view.diff_buf, silent = true })
-	vim.keymap.set("n", "<leader>a", accept_hunk, { buffer = view.diff_buf, silent = true })
-	vim.keymap.set("n", "r", reject_hunk, { buffer = view.diff_buf, silent = true })
-	vim.keymap.set("n", "<leader>r", reject_hunk, { buffer = view.diff_buf, silent = true })
-	vim.keymap.set("n", "q", close_view, { buffer = view.diff_buf, silent = true })
-
-	vim.api.nvim_set_current_win(view.diff_win)
-
-	-- Auto-refresh when state changes (e.g. watcher adds a new turn).
-	diff_state.on_change(refresh_view)
-
-	log.debug("diff.view", "opened review" .. (session and (" for session " .. session.id) or " (pending)"))
-end
-
-log.debug("diff.view", "loaded")
 
 return M

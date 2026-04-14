@@ -1,130 +1,106 @@
--- Accept/reject logic for individual file edits from Cursor agent sessions.
+-- Accept / reject helpers for diff change blocks.
+-- Accepting a change writes newText to disk and marks the DB row "accepted".
+-- Rejecting only marks the DB row "rejected" (no file modification).
 
-local log = require("neovim-cursor.log")
+local db = require("neovim-cursor.acp.db")
 
 local M = {}
 
--- Apply a single StrReplace edit to a file on disk.
-function M.apply_str_replace(edit)
-	local path = edit.path
-	local f = io.open(path, "r")
-	if not f then
-		vim.notify("Cannot read " .. path, vim.log.levels.ERROR)
-		return false
-	end
-	local content = f:read("*a")
-	f:close()
+-- Write the new_text of a change to disk and mark it accepted.
+-- @param change table  A row from db.get_pending / db.get_all
+--                      Must have: id, file_path, new_text
+-- @return boolean  true on success
+function M.accept(change)
+  if not change or not change.file_path or not change.new_text then
+    return false
+  end
 
-	local start_idx, end_idx = content:find(edit.old_string, 1, true)
-	if not start_idx then
-		vim.notify("old_string not found in " .. path .. ", change may already be applied", vim.log.levels.WARN)
-		return false
-	end
+  -- Split by newline; writefile expects a list of lines (no trailing \n per element).
+  local lines = vim.split(change.new_text, "\n", { plain = true })
 
-	local new_content = content:sub(1, start_idx - 1) .. edit.new_string .. content:sub(end_idx + 1)
+  -- Remove a single trailing empty element produced by a trailing newline.
+  if #lines > 0 and lines[#lines] == "" then
+    lines[#lines] = nil
+  end
 
-	local fw = io.open(path, "w")
-	if not fw then
-		vim.notify("Cannot write " .. path, vim.log.levels.ERROR)
-		return false
-	end
-	fw:write(new_content)
-	fw:close()
+  local abs_path = vim.fn.fnamemodify(change.file_path, ":p")
 
-	log.debug("diff.actions", "applied str_replace to " .. path)
-	return true
+  -- Ensure parent directory exists.
+  local parent = vim.fn.fnamemodify(abs_path, ":h")
+  vim.fn.mkdir(parent, "p")
+
+  local result = vim.fn.writefile(lines, abs_path)
+  if result ~= 0 then
+    vim.notify(
+      string.format("[neovim-cursor] Failed to write %s", change.file_path),
+      vim.log.levels.ERROR
+    )
+    return false
+  end
+
+  db.mark_status(change.id, "accepted")
+
+  -- If the file is open in a buffer, reload it to reflect the change.
+  vim.schedule(function()
+    for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+      local buf_name = vim.api.nvim_buf_get_name(buf)
+      if vim.fn.fnamemodify(buf_name, ":p") == abs_path then
+        if vim.api.nvim_buf_is_loaded(buf) then
+          vim.api.nvim_buf_call(buf, function()
+            vim.cmd("edit!")
+          end)
+        end
+        break
+      end
+    end
+  end)
+
+  return true
 end
 
--- Apply a Write edit (full file overwrite).
-function M.apply_write(edit)
-	local dir = vim.fn.fnamemodify(edit.path, ":h")
-	vim.fn.mkdir(dir, "p")
-
-	local fw = io.open(edit.path, "w")
-	if not fw then
-		vim.notify("Cannot write " .. edit.path, vim.log.levels.ERROR)
-		return false
-	end
-	fw:write(edit.content)
-	fw:close()
-
-	log.debug("diff.actions", "applied write to " .. edit.path)
-	return true
+-- Mark a change as rejected (no file modification).
+-- @param change table  Must have: id
+-- @return boolean
+function M.reject(change)
+  if not change or not change.id then
+    return false
+  end
+  db.mark_status(change.id, "rejected")
+  return true
 end
 
--- Revert a single StrReplace edit (swap old/new).
-function M.revert_str_replace(edit)
-	local path = edit.path
-	local f = io.open(path, "r")
-	if not f then
-		vim.notify("Cannot read " .. path, vim.log.levels.ERROR)
-		return false
-	end
-	local content = f:read("*a")
-	f:close()
-
-	local start_idx, end_idx = content:find(edit.new_string, 1, true)
-	if not start_idx then
-		vim.notify("new_string not found in " .. path .. ", change may not be applied", vim.log.levels.WARN)
-		return false
-	end
-
-	local reverted = content:sub(1, start_idx - 1) .. edit.old_string .. content:sub(end_idx + 1)
-
-	local fw = io.open(path, "w")
-	if not fw then
-		vim.notify("Cannot write " .. path, vim.log.levels.ERROR)
-		return false
-	end
-	fw:write(reverted)
-	fw:close()
-
-	log.debug("diff.actions", "reverted str_replace in " .. path)
-	return true
+-- Accept all pending changes for a given file path within a project cwd.
+-- @param file_path  string  The file path (as stored in the DB)
+-- @param cwd        string  Project root used to scope the query
+-- @return number  Count of changes accepted
+function M.accept_all_in_file(file_path, cwd)
+  local changes = db.get_pending(cwd)
+  local count   = 0
+  for _, change in ipairs(changes) do
+    if change.file_path == file_path then
+      if M.accept(change) then
+        count = count + 1
+      end
+    end
+  end
+  return count
 end
 
--- Accept an edit: for str_replace edits the change should already be on disk
--- (the agent applied it), so this is a no-op marking.  For write edits same.
-function M.accept(edit)
-	log.debug("diff.actions", "accepted edit on " .. edit.path)
-	return true
+-- Reject all pending changes for a given file path within a project cwd.
+-- @param file_path  string
+-- @param cwd        string
+-- @return number  Count of changes rejected
+function M.reject_all_in_file(file_path, cwd)
+  local changes = db.get_pending(cwd)
+  local count   = 0
+  for _, change in ipairs(changes) do
+    if change.file_path == file_path then
+      if M.reject(change) then
+        count = count + 1
+      end
+    end
+  end
+  return count
 end
-
--- Reject an edit: undo it on disk.
-function M.reject(edit)
-	if edit.type == "str_replace" then
-		return M.revert_str_replace(edit)
-	elseif edit.type == "write" then
-		vim.notify("Cannot auto-revert a full Write; restore from git", vim.log.levels.WARN)
-		return false
-	elseif edit.type == "apply_patch" then
-		vim.notify("Cannot auto-revert an ApplyPatch; restore from git", vim.log.levels.WARN)
-		return false
-	end
-	return false
-end
-
--- Build a unified diff string between two text blocks.
-function M.compute_diff(old_text, new_text)
-	if not old_text then
-		old_text = ""
-	end
-	if not new_text then
-		new_text = ""
-	end
-	if not old_text:match("\n$") then
-		old_text = old_text .. "\n"
-	end
-	if not new_text:match("\n$") then
-		new_text = new_text .. "\n"
-	end
-	local result = vim.diff(old_text, new_text, {
-		result_type = "unified",
-		ctxlen = 3,
-	})
-	return result or ""
-end
-
-log.debug("diff.actions", "loaded")
 
 return M

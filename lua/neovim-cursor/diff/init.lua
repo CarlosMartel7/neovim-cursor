@@ -1,90 +1,116 @@
--- Diff review module entry point for neovim-cursor.
+-- Entry point for the neovim-cursor diff subsystem.
 --
--- Two flows:
---   1. Watcher flow: monitors ~/.cursor/projects/<hash>/worker.log for
---      "Indexing finished" events, then re-reads the agent transcript to
---      detect new edits.  :CursorDiff opens the view over that state.
---   2. Picker flow (fallback): :CursorDiff opens a Telescope session
---      picker and loads the selected session's edits into state.
-
-local picker = require("neovim-cursor.diff.picker")
-local view = require("neovim-cursor.diff.view")
-local watcher = require("neovim-cursor.diff.watcher")
-local diff_state = require("neovim-cursor.diff.state")
-local log = require("neovim-cursor.log")
+-- Responsibilities:
+--   setup()          — initialise DB, register :CursorDiff command,
+--                       schedule a startup notification if pending changes exist
+--   open()           — open the two-panel diff viewer
+--   start_watching() — connect the ACP client for a project directory
+--                       (called by tabs.lua every time a new agent terminal starts)
 
 local M = {}
 
---- Open the diff review.
---- If the watcher has accumulated pending state, show it directly.
---- Otherwise fall back to the session picker.
-function M.open()
-	if #diff_state.get_turns() > 0 then
-		view.open(nil)
-		return
-	end
+-- Lazy-load heavy dependencies so that the module loads fast at startup.
+local function get_db()      return require("neovim-cursor.acp.db")      end
+local function get_client()  return require("neovim-cursor.acp.client")  end
+local function get_view()    return require("neovim-cursor.diff.view")    end
 
-	picker.pick_session(function(session)
-		if session then
-			view.open(session)
-		end
-	end)
-end
-
---- Start watching worker.log for the given project directory.
---- @param project_cwd string absolute project path
-function M.start_watching(project_cwd)
-	diff_state.reset()
-	watcher.start(project_cwd)
-end
-
---- Stop the active watcher.
-function M.stop_watching()
-	watcher.stop()
-end
+-- ---------------------------------------------------------------------------
+-- setup()
+-- ---------------------------------------------------------------------------
 
 function M.setup()
-	vim.api.nvim_create_user_command("CursorDiff", function()
-		M.open()
-	end, {
-		desc = "Review Cursor agent changes (diff viewer)",
-	})
+  local db_ok = get_db().init()
+  if not db_ok then
+    -- lsqlite3 not available; notify once and degrade gracefully.
+    vim.schedule(function()
+      vim.notify(
+        "[neovim-cursor] lsqlite3 not found – diff persistence disabled.\n"
+          .. "Install with: luarocks install lsqlite3",
+        vim.log.levels.WARN
+      )
+    end)
+  end
 
-	vim.api.nvim_create_user_command("CursorDiffReset", function()
-		diff_state.reset()
-		vim.notify("Diff pending state cleared", vim.log.levels.INFO)
-	end, {
-		desc = "Clear accumulated diff state",
-	})
+  -- Register :CursorDiff command
+  if not pcall(vim.api.nvim_get_commands, {}) or true then
+    vim.api.nvim_create_user_command("CursorDiff", function()
+      M.open()
+    end, {
+      desc = "Open diff viewer for pending ACP changes",
+    })
+  end
 
-	vim.api.nvim_create_user_command("CursorDiffStatus", function()
-		local sum = diff_state.summary()
-		local watching = watcher.is_active() and ("watching " .. watcher.get_path()) or "not watching"
-		vim.notify(
-			string.format(
-				"Diff: %d turn(s), %d edit(s) — %d accepted, %d rejected, %d pending  [%s]",
-				sum.turns,
-				sum.total,
-				sum.accepted,
-				sum.rejected,
-				sum.pending,
-				watching
-			),
-			vim.log.levels.INFO
-		)
-	end, {
-		desc = "Show diff watcher and pending state status",
-	})
+  -- Register VimLeavePre to cleanly close the ACP clients and DB.
+  vim.api.nvim_create_autocmd("VimLeavePre", {
+    group    = vim.api.nvim_create_augroup("NeovimCursorACP", { clear = true }),
+    callback = function()
+      pcall(function() get_client().disconnect_all() end)
+      pcall(function() get_db().close() end)
+    end,
+  })
+
+  -- Startup notification: check for pending changes on VimEnter (deferred so
+  -- that the user's config is fully processed before we bother them).
+  vim.api.nvim_create_autocmd("VimEnter", {
+    group = vim.api.nvim_create_augroup("NeovimCursorDiffStartup", { clear = true }),
+    once  = true,
+    callback = function()
+      vim.schedule(function()
+        local cwd = vim.fn.getcwd()
+        local ok, has = pcall(function() return get_db().has_pending(cwd) end)
+        if ok and has then
+          vim.notify(
+            "[neovim-cursor] You have pending diff changes for this project.\n"
+              .. "Run :CursorDiff to review them.",
+            vim.log.levels.INFO
+          )
+        end
+      end)
+    end,
+  })
 end
 
--- Expose submodules
-M.parser = require("neovim-cursor.diff.parser")
-M.picker = picker
-M.view = view
-M.watcher = watcher
-M.state = diff_state
-M.actions = require("neovim-cursor.diff.actions")
+-- ---------------------------------------------------------------------------
+-- open()
+-- ---------------------------------------------------------------------------
 
-log.debug("diff", "loaded")
+function M.open()
+  get_view().open({ cwd = vim.fn.getcwd() })
+end
+
+-- ---------------------------------------------------------------------------
+-- start_watching()
+-- ---------------------------------------------------------------------------
+
+-- Called by tabs.lua each time a new agent terminal is created.
+-- Spawns (or re-uses) the ACP background process for this directory.
+-- @param dir string  Absolute project directory
+function M.start_watching(dir)
+  if not dir or dir == "" then
+    dir = vim.fn.getcwd()
+  end
+  dir = vim.fn.fnamemodify(dir, ":p"):gsub("[/\\]$", "")
+
+  local client_mod = get_client()
+
+  -- Already connected → nothing to do.
+  if client_mod.is_connected(dir) then
+    return
+  end
+
+  client_mod.connect(dir, {
+    on_diff = function(change_row)
+      -- Refresh the viewer if it's open so the new change appears immediately.
+      pcall(function()
+        local view = require("neovim-cursor.diff.view")
+        -- Only refresh if the viewer buffers are alive.
+        view.refresh()
+      end)
+    end,
+    on_ready = function(_client)
+      require("neovim-cursor.log").debug("diff", "ACP ready for " .. dir)
+    end,
+  })
+end
 
 return M
